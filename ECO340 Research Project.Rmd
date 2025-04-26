@@ -1,0 +1,781 @@
+---
+title: "Income Inequality and Labour Market Outcomes in Canada 2006-2024"
+author: "Alex McKeown"
+date: "2025-03-29"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    fig_caption: true
+    number_sections: false
+    theme: cosmo
+    css: styles.css
+    highlight: tango
+    code_folding: hide
+    self_contained: true
+    df_print: paged
+    mathjax: default
+---
+
+```{css, echo=FALSE}
+body {
+  font-family: "Times New Roman", Times, serif;
+  line-height: 2;
+  font-size: 12pt;
+}
+
+h1, h2, h3, h4, h5, h6 {
+  font-family: "Times New Roman", Times, serif;
+  font-weight: bold;
+}
+
+.main-container {
+  max-width: 8.5in;
+  margin: auto;
+}
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,       # Changed from FALSE to TRUE to allow code folding
+  warning = FALSE,    
+  message = FALSE,    
+  fig.width = 10,     
+  fig.height = 6,     
+  fig.align = "center", 
+  dpi = 300,
+  gc.verbose = FALSE  # Suppress garbage collection output
+)
+
+# Make sure the required packages for code folding are loaded
+if (!requireNamespace("rmarkdown", quietly = TRUE)) {
+  install.packages("rmarkdown")
+}
+if (!requireNamespace("knitr", quietly = TRUE)) {
+  install.packages("knitr")
+}
+```
+
+```{r packages-and-data, include=FALSE}
+# Setup - Clear workspace and manage packages
+# Define required packages, install if needed, load all packages, set working directory,
+# load and combine data from CSV files matching the pattern "^pub(01|06)\\d{2}\\.csv$"
+rm(list = ls())
+invisible(gc())
+
+required_packages <- c(
+  "data.table", "dplyr", "tidyverse", "plm",
+  "caret", "cluster", "modelsummary", "ineq", "ggplot2", "broom", 
+  "rmarkdown"
+)
+
+packages_loaded <- sapply(required_packages, function(pkg) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    message(paste("Installing package:", pkg))
+    tryCatch({
+        install.packages(pkg, dependencies = TRUE)
+        library(pkg, character.only = TRUE)
+        return(TRUE)
+      }, error = function(e) {
+        message(paste("Failed to install package:", pkg, "Error:", e$message))
+        return(FALSE)
+      })
+  } else {
+    library(pkg, character.only = TRUE)
+    return(TRUE)
+  }
+})
+
+if (!packages_loaded["data.table"]) {
+  stop("Critical package 'data.table' could not be loaded. Aborting.")
+}
+
+csv_folder_path <- "C:/Users/Alex/Desktop/Alex_ECO340_Project" #modify this path!!!
+tryCatch({
+    setwd(csv_folder_path)
+  }, warning = function(w){
+    stop("Warning setting working directory: ", w$message, ". Check path: ", csv_folder_path)
+  }, error = function(e) {
+    stop("Error setting working directory: ", e$message, ". Check path: ", csv_folder_path)
+  }
+)
+
+# Find and load CSV files matching the pattern
+all_csv_files <- list.files(path = getwd(), pattern = "\\.csv$", full.names = TRUE, ignore.case = TRUE)
+filename_pattern <- "^pub(01|06)\\d{2}\\.csv$"
+all_basenames <- basename(all_csv_files)
+matching_indices <- grepl(filename_pattern, all_basenames, ignore.case = TRUE)
+csv_files <- all_csv_files[matching_indices]
+
+if (length(csv_files) == 0) {
+  stop("No CSV files matching the pattern '", filename_pattern, "' were found in ", getwd())
+} else {
+  LFS_data <- NULL
+  for (i in seq_along(csv_files)) {
+    file_path <- csv_files[i]
+
+    current_data <- tryCatch({
+        data.table::fread(file_path, showProgress = FALSE)
+      }, error = function(e) {
+        return(NULL)
+      })
+
+    if (!is.null(current_data) && nrow(current_data) > 0) {
+      if (is.null(LFS_data)) {
+        LFS_data <- current_data
+      } else {
+        LFS_data <- data.table::rbindlist(list(LFS_data, current_data), use.names = TRUE, fill = TRUE)
+      }
+    }
+    rm(current_data)
+    invisible(gc())
+  }
+  rm(all_csv_files, all_basenames, matching_indices, csv_files, file_path)
+  invisible(gc())
+}
+```
+
+# Introduction
+
+This analysis hopes to help better unpack income inequality in the Canadian context. This analysis investigates trends in income inequality within different groupings of Labour Force Survey (LFS) observations over a near eighteen year period, from January 2006 to June 2024 – every 6th month of LFS data was used for this analysis, to put less stress on memory constraints. Using this data, a multivariable regression model to predict hourly earnings based on key variables was built. Then, using this model to identify potentially interesting areas of difference, subsets of the LFS survey sample were constructed, creating a time series of Gini coefficients for hourly income within each group selected. For instance, comparing trends over time for the Gini coefficient within the male population versus the female population. It is important to note that this report uses the Public Use Microdata File (PUMF) which contains less information than the full data – the PUMF omits information such as race, city/municipality located, etc. As well, the LFS is a repeated cross-section of the population, it is not a cohort study like the National Longitudinal Survey of Youth (NLSY) conducted by the US Bureau of Labour Statistics, so techniques applicable to that dataset, such as a fixed effect model, are not applicable here.
+
+*Note: switch file path on line 94 to folder on your PC*
+
+# Data Cleaning and Variable Creation
+
+```{r data-cleaning, include=FALSE}
+# Data Cleaning & Variable Creation
+# Convert variables to appropriate formats and create binary indicators for analysis
+
+setDT(LFS_data)
+
+#Log Hourly Earnings
+LFS_data[, ln_income := log(HRLYEARN)]
+
+# Employment and Labour Force Status
+LFS_data[, is_employed := fifelse(LFSSTAT == 1, 1, 0)]
+LFS_data[, in_lf := fifelse(LFSSTAT %in% c(1, 2), 1, 0)]
+
+# Sex
+LFS_data[, woman := fifelse(SEX == 2 | GENDER == 2, 1L, 0L, na = 0L)]
+
+# Age
+LFS_data[, rough_age_dock15 := fcase(
+    AGE_12 == 1,  2, AGE_12 == 2,  7, AGE_12 == 3,  12, AGE_12 == 4,  17,
+    AGE_12 == 5,  22, AGE_12 == 6,  27, AGE_12 == 7,  32, AGE_12 == 8,  37,
+    AGE_12 == 9,  42, AGE_12 == 10, 47, AGE_12 == 11, 52, AGE_12 == 12, 57,
+    default = NA_real_
+)]
+
+# Province indicators
+LFS_data[, prov_nl := fifelse(PROV == 10, 1, 0)]
+LFS_data[, prov_pe := fifelse(PROV == 11, 1, 0)]
+LFS_data[, prov_ns := fifelse(PROV == 12, 1, 0)]
+LFS_data[, prov_nb := fifelse(PROV == 13, 1, 0)]
+LFS_data[, prov_qc := fifelse(PROV == 24, 1, 0)]
+LFS_data[, prov_mb := fifelse(PROV == 46, 1, 0)]
+LFS_data[, prov_sk := fifelse(PROV == 47, 1, 0)]
+LFS_data[, prov_ab := fifelse(PROV == 48, 1, 0)]
+LFS_data[, prov_bc := fifelse(PROV == 59, 1, 0)]
+province_dummies <- c("prov_nl", "prov_pe", "prov_ns", "prov_nb", "prov_qc", "prov_mb", "prov_sk", "prov_ab", "prov_bc")
+
+# Union status
+LFS_data[, union_member := fifelse(UNION == 1, 1, 0)]
+LFS_data[, union_contract := fifelse(UNION %in% c(1, 2), 1, 0)]
+
+# Immigration status
+LFS_data[, newer_immigrant := fifelse(IMMIG == 1, 1, 0)]
+LFS_data[, older_immigrant := fifelse(IMMIG == 2, 1, 0)]
+
+# Education dummies
+
+LFS_data[, zero_to_eight := fifelse(EDUC == 0, 1, 0)]
+LFS_data[, some_hs := fifelse(EDUC == 1, 1, 0)]
+LFS_data[, some_ps := fifelse(EDUC == 3, 1, 0)]
+LFS_data[, ps_cert := fifelse(EDUC == 4, 1, 0)]
+LFS_data[, ba := fifelse(EDUC == 5, 1, 0)]
+LFS_data[, above_ba := fifelse(EDUC == 6, 1, 0)]
+education_dummies <- c("zero_to_eight", "some_hs", "some_ps", "ps_cert", "ba", "above_ba")
+
+# NAICS industry dummies
+LFS_data[, naics_ForestryLogSupport := fifelse(NAICS_21 == 2, 1, 0)]
+LFS_data[, naics_FishingHuntTrap := fifelse(NAICS_21 == 3, 1, 0)]
+LFS_data[, naics_MiningOilGasExtract := fifelse(NAICS_21 == 4, 1, 0)]
+LFS_data[, naics_Utilities := fifelse(NAICS_21 == 5, 1, 0)]
+LFS_data[, naics_Construction := fifelse(NAICS_21 == 6, 1, 0)]
+LFS_data[, naics_MfgDurable := fifelse(NAICS_21 == 7, 1, 0)]
+LFS_data[, naics_MfgNonDurable := fifelse(NAICS_21 == 8, 1, 0)]
+LFS_data[, naics_Wholesale := fifelse(NAICS_21 == 9, 1, 0)]
+LFS_data[, naics_Retail := fifelse(NAICS_21 == 10, 1, 0)]
+LFS_data[, naics_TransportWarehousing := fifelse(NAICS_21 == 11, 1, 0)]
+LFS_data[, naics_FinanceInsurance := fifelse(NAICS_21 == 12, 1, 0)]
+LFS_data[, naics_RealEstateRentalLeasing := fifelse(NAICS_21 == 13, 1, 0)]
+LFS_data[, naics_ProfSciTech := fifelse(NAICS_21 == 14, 1, 0)]
+LFS_data[, naics_BusinessBuildingSupport := fifelse(NAICS_21 == 15, 1, 0)]
+LFS_data[, naics_Educational := fifelse(NAICS_21 == 16, 1, 0)]
+LFS_data[, naics_HealthSocialAssist := fifelse(NAICS_21 == 17, 1, 0)]
+LFS_data[, naics_InfoCultRec := fifelse(NAICS_21 == 18, 1, 0)]
+LFS_data[, naics_AccomFood := fifelse(NAICS_21 == 19, 1, 0)]
+LFS_data[, naics_OtherServices := fifelse(NAICS_21 == 20, 1, 0)]
+LFS_data[, naics_PublicAdmin := fifelse(NAICS_21 == 21, 1, 0)]
+naics_dummies <- c(
+  "naics_ForestryLogSupport", "naics_FishingHuntTrap", "naics_MiningOilGasExtract", "naics_Utilities",
+  "naics_Construction", "naics_MfgDurable", "naics_MfgNonDurable", "naics_Wholesale",
+  "naics_Retail", "naics_TransportWarehousing", "naics_FinanceInsurance", "naics_RealEstateRentalLeasing",
+  "naics_ProfSciTech", "naics_BusinessBuildingSupport", "naics_Educational", "naics_HealthSocialAssist",
+  "naics_InfoCultRec", "naics_AccomFood", "naics_OtherServices", "naics_PublicAdmin"
+)
+
+# Time variables
+LFS_data[, years_from_start := (SURVYEAR - 2006) + ifelse(SURVMNTH == 6, 0.5, 0)]
+yfs_dummy_names <- character(0)
+unique_vals <- sort(unique(na.omit(LFS_data$years_from_start)))
+
+if (length(unique_vals) > 0) {
+  for (val in unique_vals) {
+    new_col_name <- paste0("yfs_", gsub("[^a-zA-Z0-9_]", "_", as.character(val)))
+    yfs_dummy_names <- c(yfs_dummy_names, new_col_name)
+    LFS_data[, (new_col_name) := fifelse(years_from_start == val, 1L, 0L, na = 0L)]
+  }
+}
+
+# Categorical variables for grouping
+LFS_data[, province_name := fcase(
+    PROV == 10, "Newfoundland and Labrador", PROV == 11, "Prince Edward Island",
+    PROV == 12, "Nova Scotia", PROV == 13, "New Brunswick",
+    PROV == 24, "Quebec", PROV == 35, "Ontario",
+    PROV == 46, "Manitoba", PROV == 47, "Saskatchewan",
+    PROV == 48, "Alberta", PROV == 59, "British Columbia"
+)]
+
+LFS_data[, named_sex := fcase(woman == 0, "Male", woman == 1, "Female")]
+
+LFS_data[, age_group := fcase(
+    AGE_12 == 1, "15_19",
+    AGE_12 %in% c(2, 3, 4), "20_34",
+    AGE_12 %in% c(5, 6, 7, 8), "35_54",
+    AGE_12 %in% c(9, 10, 11, 12), "55+",
+    default = NA_character_
+)]
+
+rm(unique_vals, val, new_col_name)
+invisible(gc())
+```
+
+To make analysis easier, I created several derived variables from the raw LFS data. Variables with multiple categories in numeric form, such as province codes, were converted to binary dummy variables. The key transformations include:
+
+-   Gender: re-coded from 1 & 2 to 0 & 1 for regression analysis
+-   Union status: created separate indicators for union membership and being covered by a union contract
+-   Provinces: created 9 dummy variables with Ontario as the reference province
+-   Education: created dummy variables, one for each level of education save the reference, which I set to high school grad rather than 0-8 years as I feel it is more intuitive when interpreting regression results – we don’t care as much about how college impacts earnings relative to someone who didn’t complete highschool.
+-   Age: approximated using AGE12 variable, creating a running variable and labels for subsetting later on
+-   Labour force status: converted LFSSTAT into two dummies for employment and labour force participation
+-   Immigration status: created dummy variables for recent immigrants (≤10 years) and established immigrants
+-   Income: created a logarithmic version of hourly earnings for easier interpretation in regressions
+
+The data.table package was used rather than the mutate function. The reason for this is because initially, I was stubbornly trying to do this analysis using every month of LFS survey data from 2006 through to the most recent release. In hindsight, that was a really silly decision, and I should have done this approach of looking at every few waves from the get go. Alternatively, I could have taken a sample of each sample, though this may wind up introducing different biases into the data, if say certain smaller provinces were under-represented (alternatively alternatively I could have swapped from working on my dated MacBook to a more powerful machine with 8x the RAM, but keeping myself constrained both a) encourages sensible code & optimization for memory and b) makes sure that whoever reads this can run the code on their machine).
+
+
+
+# Wage Determinants: Regression Analysis Methodology
+
+This section examines the impact of key variables and controls on hourly earnings. As this model is estimated by applying it to multiple waves of LFS data, which are cross-sections of the population rather than a cohort study like the NLSY, year dummy variables are included to account for time fixed-effects and year-specific events. The analysis is restricted to employed Canadians, one deficit of this analysis is that the unemployment rate & labour force participation rate could belie interest shifts in the labour market – if there is declining inequality of income distribution among employed Canadian, but this is accompanied by a sharp rise in the unemployment rate, has equality of earnings distribution really improved? 
+
+The purpose of this section is not to derive any profound insights into the determinants of wages in Canada, rather the goal is to create a starting point for how we can divide up our sample to compare the trends of Gini coefficients over time. The dependent variable in these regressions is the natural logarithm of hourly earnings, for easier interpretation of coefficients. The "base" or intercept observation in the final model (and thus for relevant terms, all models) is:
+Part of the June 2024 LFS
+Male
+Not an immigrant
+Not covered by a union contract
+Graduated from highschool
+From Ontario
+Working in the Agriculture Industry
+15 years old (Age is a discrete running variable based on age bracket midpoints)
+
+
+To start building the model, I began by using gender alongside the aforementioned time dummies. The only controls included were to control for temporal effects – this lengthy string of dummy variables is omitted completely from the final output. The further back the year was, the larger the deviation from the reference period of the June 2024 LFS was, that is to say the coefficient was a larger negative modifier. Every single dummy variable’s coefficient was significant at p < 0.001, except for January 2024, which wasn’t (until more variables were added) significant to any meaningful level – this aligns with intuition. This is model 1, “Gender Only.”
+
+Layering on, adding province of residence should help control for certain factors such as cost of living – as this is the PUMF, geographic identifiers are limited to provinces and the 9 largest Census Metropolitan Areas (CMAs), so I didn’t include a rural/suburban/urban variable. This is model 2, “Add Provinces.” For ease of viewing, I only display the dummies for Quebec, Alberta, and British Columbia.
+
+I then account for the impact of education, layering on another set of dummy variables. Similarly, for ease of viewing, I only include the coefficients for 0-8 years of education, graduating with a bachelor’s degree, and graduating with more than a bachelor’s degree. This is model 3, “Add Education.”
+
+Next, I decided to use a two term model for age’s impact on earnings. As I wasn’t completely sure how to choose the “best” number of terms, I used the Akaike Information Criteria (AIC) score to see where adding more terms stopped meaningfully improving prediction error. While the AIC score was minimized at seven terms, by far and away the largest improvement was from adding that second term – for ease I just stopped at two. This makes model 4, “Add Age.”
+
+I then add in industry (based on NAICS code), whether the worker is covered by a union contract, if the worker is a recent/established immigrant (distinguishing between the two). This is model 5, the “Full Model.” For ease of viewing, I omit most industries, opting to show mining & oil extraction, finance & insurance, and healthcare & social assistance.
+
+To see those variables which have been omitted from the table on display, including time (denoted as years from start of sample period in the coefficient naming scheme), click the button below to view the full table. 
+
+
+```{r wage-regressions}
+# Store the models for comparison
+models <- list()
+
+# Model 1: Basic with gender and year effects only
+dummy_formula_part <- paste(yfs_dummy_names, collapse = " + ")
+regression_formula <- as.formula(paste("ln_income ~ woman +", dummy_formula_part))
+models[[1]] <- lm(regression_formula, data = LFS_data)
+rm(regression_formula, dummy_formula_part)
+invisible(gc())
+
+# Model 2: Adding province effects
+dummy_formula_part1 <- paste(yfs_dummy_names, collapse = " + ")
+dummy_formula_part2 <- paste(province_dummies, collapse = " + ")
+regression_formula <- as.formula(paste("ln_income ~ woman + ", dummy_formula_part1, " + ", dummy_formula_part2))
+models[[2]] <- lm(regression_formula, data = LFS_data)
+rm(regression_formula, dummy_formula_part1, dummy_formula_part2)
+invisible(gc())
+
+# Model 3: Adding education effects
+dummy_formula_part1 <- paste(yfs_dummy_names, collapse = " + ")
+dummy_formula_part2 <- paste(province_dummies, collapse = " + ")
+dummy_formula_part3 <- paste(education_dummies, collapse = " + ")
+regression_formula <- as.formula(paste("ln_income ~ woman + ", dummy_formula_part1, " + ", dummy_formula_part2, " + ", dummy_formula_part3))
+models[[3]] <- lm(regression_formula, data = LFS_data)
+rm(regression_formula, dummy_formula_part1, dummy_formula_part2, dummy_formula_part3)
+invisible(gc())
+
+# Model 4: Adding age polynomial
+dummy_formula_part1 <- paste(yfs_dummy_names, collapse = " + ")
+dummy_formula_part2 <- paste(province_dummies, collapse = " + ")
+dummy_formula_part3 <- paste(education_dummies, collapse = " + ")
+regression_formula <- as.formula(paste("ln_income ~ woman + poly(rough_age_dock15, 2, raw=TRUE) + ",
+                                     dummy_formula_part1, " + ", dummy_formula_part2, " + ", dummy_formula_part3))
+models[[4]] <- lm(regression_formula, data = LFS_data)
+rm(regression_formula, dummy_formula_part1, dummy_formula_part2, dummy_formula_part3)
+invisible(gc())
+
+# Model 5: Full model with union, immigration, and industry sectors
+dummy_formula_part1 <- paste(yfs_dummy_names, collapse = " + ")
+dummy_formula_part2 <- paste(province_dummies, collapse = " + ")
+dummy_formula_part3 <- paste(education_dummies, collapse = " + ")
+dummy_formula_part4 <- paste(naics_dummies, collapse = " + ")
+regression_formula <- as.formula(paste("ln_income ~ woman + poly(rough_age_dock15, 2, raw=TRUE) + newer_immigrant + older_immigrant + union_contract + ",
+                                     dummy_formula_part1, " + ", dummy_formula_part2, " + ", dummy_formula_part3, " + ", dummy_formula_part4))
+models[[5]] <- lm(regression_formula, data = LFS_data)
+rm(regression_formula, dummy_formula_part1, dummy_formula_part2, dummy_formula_part3, dummy_formula_part4)
+invisible(gc())
+
+# Define model names for the table
+model_names <- c("Gender Only", "Add Provinces", "Add Education", "Add Age", "Full Model")
+names(models) <- model_names
+
+# Create a custom coefficient map for the table
+coef_map <- c(
+  "(Intercept)" = "Intercept",
+  "woman" = "Female",
+  "poly(rough_age_dock15, 2, raw = TRUE)1" = "Age",
+  "poly(rough_age_dock15, 2, raw = TRUE)2" = "Age²",
+  "newer_immigrant" = "Recent Immigrant (≤10yrs)",
+  "older_immigrant" = "Established Immigrant (>10yrs)",
+  "union_contract" = "Union Coverage",
+  
+  # Key education variables
+  "zero_to_eight" = "Education: 0-8 years",
+  "ba" = "Education: Bachelor's degree",
+  "above_ba" = "Education: Above bachelor's",
+  
+  # Selected provinces
+  "prov_qc" = "Quebec",
+  "prov_ab" = "Alberta",
+  "prov_bc" = "British Columbia",
+  
+  # Selected industry sectors
+  "naics_MiningOilGasExtract" = "Industry: Mining & Oil Extraction",
+  "naics_FinanceInsurance" = "Industry: Finance & Insurance",
+  "naics_HealthSocialAssist" = "Industry: Healthcare & Social Assist."
+)
+
+# Generate regression table
+modelsummary(models,
+             title = "Log Wage Regressions with Different Specifications",
+             stars = TRUE,
+             coef_map = coef_map,
+             gof_map = c("nobs", "r.squared", "adj.r.squared"),
+             notes = "Year fixed effects included in all models. Ontario is the reference province. Full range of dummy variables not shown for ease of viewing",
+             output = "html")
+
+
+```
+
+```{r all-models-full-comparison-collapsible, echo=FALSE, results='asis'}
+## Comparison of All Regression Models (Collapsible)
+# This chunk generates a collapsible HTML table comparing all regression models
+# and displaying all coefficients.
+# The code itself is hidden (echo=FALSE).
+# results='asis' allows us to print raw HTML tags directly.
+
+# Ensure the models list exists and contains models
+if (!exists("models") || length(models) == 0) {
+  stop("Regression models not found. Please ensure the 'wage-regressions' chunk ran successfully.")
+}
+
+# Start the collapsible section using HTML <details> tag
+cat('<details>')
+# Add a summary line that the user clicks to expand/collapse
+cat('<summary>Click to show/hide the full comparison table of all models</summary>')
+
+# Generate the modelsummary comparison table for ALL models.
+# Omit coef_map to show all coefficients.
+# With output='html' and results='asis', modelsummary prints the
+# HTML table code directly into the document at this point.
+modelsummary(models, # Pass the list of all models
+             title = "Comparison of All Log Wage Regression Models (Full Coefficients)",
+             stars = TRUE,
+             gof_map = c("nobs", "r.squared", "adj.r.squared"),
+             notes = "Includes all dummy variables (Year, Province, Education, Industry) where included in the model. Reference categories: Ontario, High School Graduate, Agriculture.",
+             output = "html")
+
+# End the collapsible section with the closing </details> tag
+cat('</details>')
+```
+
+``` {r}
+# Clear models to free memory
+rm(models, model_names, coef_map)
+invisible(gc())
+```
+
+## Interpretation of Model
+We see in our model that we cannot fully explain away the gender wage gap. With our full model, we see that women earn roughly 15% less hourly than their male counterparts. This is an economically significant difference, as well as being statistically significant to p < 0.001.
+Age, or rather years older than 15, is positively correlated with earnings initially, and is decreasing in the second derivative, albeit rather slowly – model #4 indicates that around roughly 34 years of age, ceteris paribus, hourly earnings peak and then start to drop off (max for function -0.001x^2 + 0.038x). These two coefficients are both statistically significant to p < 0.001. 
+Recent immigrants have a roughly 21.7% lower hourly wage, whereas established immigrants who have been here longer than 10 years have only an 8% lower wage – this may be affected by unobserved differences in tenure or accumulation of Canadian credentials.
+
+## Informing of Groups
+Looking at these results, we can slice and dice the population a good many ways for our Gini coefficient plots. This analysis will briefly touch on a few different issues/divides – the goal is to unpack how trends in inequality in Canada vary by group, using the LFS data as a rough idea. In the end, six different comparisons were made. First, comparing men and women – classic. Second, comparing provinces, potentially picking up impacts of policy options pursued by some and not others. Third, comparing on the basis of immigration status. Fourth, by education level. Fifth, intersecting gender and education level. And finally, sixth, intersecting immigration status and education level. 
+
+# Income Inequality Analysis
+The process to be applied to each of the aforementioned groups is to plot their in-group Gini coefficients over the years, and then, to provide additional context, plotting median incomes over the same period. Without median income information, an increase in the Gini coefficient could be either a story of a fortunate few pulling away from the pack, or the story of a certain section of the population having their earnings crushed. 
+
+```{r gini-calculation}
+# Function to calculate Gini coefficient for each subset by year
+calculate_gini_by_year <- function(data_subset) {
+  if (is.null(data_subset) || nrow(data_subset) < 10) {
+    return(data.frame(years_from_start = numeric(0), gini = numeric(0), median_income = numeric(0)))
+  }
+  
+  result <- data_subset[!is.na(HRLYEARN), .(
+    gini = as.numeric(ineq::ineq(HRLYEARN, type="Gini")),
+    median_income = as.numeric(median(HRLYEARN, na.rm = TRUE)),
+    count = .N
+  ), by = years_from_start]
+  
+  result <- result[count >= 30]
+  return(result[, .(years_from_start, gini, median_income)])
+}
+
+# Process gender subsets first
+gender_subsets <- split(LFS_data, LFS_data$named_sex)
+gender_gini_results <- data.frame(
+  group = character(),
+  years_from_start = numeric(),
+  gini = numeric(),
+  median_income = numeric(),
+  stringsAsFactors = FALSE
+)
+
+for (gender_name in names(gender_subsets)) {
+  subset_gini <- calculate_gini_by_year(gender_subsets[[gender_name]])
+  
+  if (nrow(subset_gini) > 0) {
+    subset_gini_df <- data.frame(
+      group = gender_name,
+      years_from_start = subset_gini$years_from_start,
+      gini = subset_gini$gini,
+      median_income = subset_gini$median_income,
+      stringsAsFactors = FALSE
+    )
+    gender_gini_results <- rbind(gender_gini_results, subset_gini_df)
+  }
+}
+
+# Convert to actual years and create gender plot
+gender_gini_results$year <- 2006 + gender_gini_results$years_from_start
+p <- ggplot(gender_gini_results, aes(x = year, y = gini, color = group)) +
+  geom_line(linewidth = 1.2) +
+  # Removed geom_smooth() line here
+  labs(title = "Income Inequality (Gini) Trends by Gender",
+       subtitle = "All of Canada",
+       x = "Year",
+       y = "Gini Coefficient",
+       color = "Gender") +
+  theme_minimal() +
+  scale_color_brewer(palette = "Set1") +
+  scale_y_continuous(limits = c(0.2, 0.35))
+print(p)
+rm(p, gender_subsets, gender_gini_results, subset_gini, subset_gini_df, gender_name)
+invisible(gc())
+
+# Process province subsets
+province_subsets <- split(LFS_data, LFS_data$province_name)
+province_gini_results <- data.frame(
+  group = character(),
+  years_from_start = numeric(),
+  gini = numeric(),
+  median_income = numeric(),
+  stringsAsFactors = FALSE
+)
+
+for (province_name in names(province_subsets)) {
+  subset_gini <- calculate_gini_by_year(province_subsets[[province_name]])
+  
+  if (nrow(subset_gini) > 0) {
+    subset_gini_df <- data.frame(
+      group = province_name,
+      years_from_start = subset_gini$years_from_start,
+      gini = subset_gini$gini,
+      median_income = subset_gini$median_income,
+      stringsAsFactors = FALSE
+    )
+    province_gini_results <- rbind(province_gini_results, subset_gini_df)
+  }
+}
+
+# Convert to actual years and create province plot
+province_gini_results$year <- 2006 + province_gini_results$years_from_start
+p <- ggplot(province_gini_results, aes(x = year, y = gini, color = group)) +
+  geom_line() +
+  # Removed geom_smooth() line here
+  labs(title = "Income Inequality Trends by Province",
+       x = "Year",
+       y = "Gini Coefficient",
+       color = "Province") +
+  theme_minimal() +
+  theme(legend.position = "bottom") +
+  guides(color = guide_legend(nrow = 2)) +
+  scale_y_continuous(limits = c(0.2, 0.35))
+print(p)
+rm(p, province_subsets, province_gini_results, subset_gini, subset_gini_df, province_name)
+invisible(gc())
+
+# Process immigration status subsets
+LFS_data[, immigration_status := fcase(
+  newer_immigrant == 1, "Recent Immigrant",
+  older_immigrant == 1, "Established Immigrant",
+  default = "Canadian-born"
+)]
+immigration_subsets <- split(LFS_data, LFS_data$immigration_status)
+immigration_gini_results <- data.frame(
+  group = character(),
+  years_from_start = numeric(),
+  gini = numeric(),
+  median_income = numeric(),
+  stringsAsFactors = FALSE
+)
+
+for (immigration_name in names(immigration_subsets)) {
+  subset_gini <- calculate_gini_by_year(immigration_subsets[[immigration_name]])
+  
+  if (nrow(subset_gini) > 0) {
+    subset_gini_df <- data.frame(
+      group = immigration_name,
+      years_from_start = subset_gini$years_from_start,
+      gini = subset_gini$gini,
+      median_income = subset_gini$median_income,
+      stringsAsFactors = FALSE
+    )
+    immigration_gini_results <- rbind(immigration_gini_results, subset_gini_df)
+  }
+}
+
+# Convert to actual years and create immigration plot
+immigration_gini_results$year <- 2006 + immigration_gini_results$years_from_start
+p <- ggplot(immigration_gini_results, aes(x = year, y = gini, color = group)) +
+  geom_line(linewidth = 1.2) +
+  # Removed geom_smooth() line here
+  labs(title = "Income Inequality Trends by Immigration Status",
+       x = "Year",
+       y = "Gini Coefficient",
+       color = "Immigration Status") +
+  theme_minimal() +
+  scale_color_brewer(palette = "Dark2") +
+  scale_y_continuous(limits = c(0.2, 0.35))
+print(p)
+rm(p, immigration_subsets, immigration_gini_results, subset_gini, subset_gini_df, immigration_name)
+invisible(gc())
+
+# Process education level subsets
+LFS_data[, education_level := fcase(
+  zero_to_eight == 1, "0-8 years",
+  some_hs == 1, "Some high school",
+  EDUC == 2, "High school graduate",
+  some_ps == 1, "Some post-secondary",
+  ps_cert == 1, "Post-secondary certificate",
+  ba == 1, "Bachelor's degree",
+  above_ba == 1, "Above bachelor's",
+  default = NA_character_
+)]
+education_subsets <- split(LFS_data, LFS_data$education_level)
+education_gini_results <- data.frame(
+  group = character(),
+  years_from_start = numeric(),
+  gini = numeric(),
+  median_income = numeric(),
+  stringsAsFactors = FALSE
+)
+
+for (education_name in names(education_subsets)) {
+  if (is.na(education_name)) next
+  
+  subset_gini <- calculate_gini_by_year(education_subsets[[education_name]])
+  
+  if (nrow(subset_gini) > 0) {
+    subset_gini_df <- data.frame(
+      group = education_name,
+      years_from_start = subset_gini$years_from_start,
+      gini = subset_gini$gini,
+      median_income = subset_gini$median_income,
+      stringsAsFactors = FALSE
+    )
+    education_gini_results <- rbind(education_gini_results, subset_gini_df)
+  }
+}
+
+# Convert to actual years and create education plot
+education_gini_results$year <- 2006 + education_gini_results$years_from_start
+filtered_education_gini <- education_gini_results[!is.na(education_gini_results$group), ]
+p <- ggplot(filtered_education_gini, aes(x = year, y = gini, color = group)) +
+  geom_line() +
+  # Removed geom_smooth() line here
+  labs(title = "Income Inequality Trends by Education Level",
+       x = "Year",
+       y = "Gini Coefficient",
+       color = "Education Level") +
+  theme_minimal() +
+  theme(legend.position = "right") +
+  scale_y_continuous(limits = c(0.15, 0.4))
+print(p)
+rm(p, education_subsets, education_gini_results, filtered_education_gini, subset_gini, subset_gini_df, education_name)
+invisible(gc())
+
+# Process gender-education intersectional analysis
+LFS_data[, gender_education := paste(named_sex, education_level, sep = " - ")]
+gender_education_subsets <- split(LFS_data, LFS_data$gender_education)
+gender_education_gini_results <- data.frame(
+  group = character(),
+  years_from_start = numeric(),
+  gini = numeric(),
+  median_income = numeric(),
+  stringsAsFactors = FALSE
+)
+
+for (gender_education_name in names(gender_education_subsets)) {
+  if (grepl("NA", gender_education_name)) next
+  
+  subset_gini <- calculate_gini_by_year(gender_education_subsets[[gender_education_name]])
+  
+  if (nrow(subset_gini) > 0) {
+    subset_gini_df <- data.frame(
+      group = gender_education_name,
+      years_from_start = subset_gini$years_from_start,
+      gini = subset_gini$gini,
+      median_income = subset_gini$median_income,
+      stringsAsFactors = FALSE
+    )
+    gender_education_gini_results <- rbind(gender_education_gini_results, subset_gini_df)
+  }
+  
+  # Periodic memory cleanup
+  if (nrow(gender_education_gini_results) %% 10 == 0) {
+    invisible(gc())
+  }
+}
+
+# Convert to actual years and create intersectional plots
+gender_education_gini_results$year <- 2006 + gender_education_gini_results$years_from_start
+
+# Filter to key education levels for readability
+key_education_levels <- c(
+  "Male - High school graduate", 
+  "Female - High school graduate",
+  "Male - Bachelor's degree", 
+  "Female - Bachelor's degree",
+  "Male - Above bachelor's", 
+  "Female - Above bachelor's"
+)
+
+filtered_gender_education <- gender_education_gini_results[
+  gender_education_gini_results$group %in% key_education_levels, 
+]
+
+# Create Gini coefficient plot
+p <- ggplot(filtered_gender_education, aes(x = year, y = gini, color = group)) +
+  geom_line() +
+  # Removed geom_smooth() line here
+  labs(title = "Income Inequality by Gender and Education Level",
+       x = "Year",
+       y = "Gini Coefficient",
+       color = "Group") +
+  theme_minimal() +
+  theme(legend.position = "right") +
+  scale_y_continuous(limits = c(0.15, 0.4))
+print(p)
+rm(p)
+
+# Create median income plot
+filtered_gender_education$median_income <- filtered_gender_education$median_income / 100 #adjusting for reporting in cents
+p <- ggplot(filtered_gender_education, aes(x = year, y = median_income, color = group)) +
+  geom_line(linewidth = 1.2) +
+  # Removed geom_smooth() line here
+  labs(title = "Median Hourly Income by Gender and Education Level",
+       x = "Year",
+       y = "Median Hourly Income ($)",
+       color = "Group") +
+  theme_minimal() +
+  theme(legend.position = "right") +
+  scale_y_continuous(labels = scales::dollar)
+print(p)
+
+# Clean up all remaining objects
+rm(p, gender_education_subsets, gender_education_gini_results, filtered_gender_education, 
+   key_education_levels, subset_gini, subset_gini_df, gender_education_name, calculate_gini_by_year)
+if(exists("LFS_data")) {
+  rm(LFS_data)
+}
+invisible(invisible(gc()))
+```
+
+## Trends in Inequality by Gender
+Looking at the results for gender there is indication that inequality among women in Canada has declined somewhat over the last 20 years relative to inequality among men. There are several potential reasons for this, perhaps sectoral differences in employment – that is to say, perhaps men tend to work more in industries where there is a higher degree of variation in wages. 
+
+## Trends in Inequality by Province
+We see Ontario, Newfoundland and Labrador, and Alberta trending near the top. We also see, particularly when looking at smoothed trend lines, that there is some degree of correlation from year to year across the country – would suggest that sector differences once again play a large role, but also that this does seem to suggest some national trends do exist – perhaps the band of acceptable wages to pay is affected by other provinces thanks to the ability for Canadians to move to work in different provinces. Though this balancing effect is naturally curbed by the, say, arbitrage costs of packing up and moving. 
+
+## Inequality Trends by Immigration Status
+Looking at immigration status there seems to be rather little difference in inequality levels between established immigrants, recent immigrants, and non-immigrants. I had expected to see greater differences, perhaps as a result of education selecting for education and putting more immigrants in sectors with greater differences in wages, but the Gini coefficient differences seem fairly insignificant.
+
+## Inequality Trends by Education
+Here we see some more interesting results – it seems that for the higher educated, those who have their bachelor degrees or higher, inequality in wages has been rising within those groups. Those with less than that have seen a decline in wage differences, and the data indicates that the same trend, but more so, is happening among those who have some high-school or some post-secondary; groups that are probably composed of a good number of students working part-time. As higher-education becomes more common, it makes sense that we’ll see more dispersion of wages as more jobs and roles require, or rather are able to hire, those with college degrees. On the flip side, it may be that declining inequality among these other positions is happening due to the same trend – there’s less breadth of roles that are available without a college degree, thus there’s less dispersion of earnings. This interpretation is perhaps supported by the relatively stable trend of inequality among those with a post-secondary certificate, interpreting this to mean largely those who learned a trade, as this level of education has not seen as big of a shift in career paths. 
+
+## Intersectional look at Inequality Trends: Gender and Education
+We see in this graph depicting the differences between men and women by degree earned that clearly both education and gender have an impact on levels of income inequality by group: that is to say, we were not seeing a lower gini coefficient in women because of some bias in education level, nor vice versa -- the trends observed when we plot education and gender groupings alone are maintained, with higher educated men and women exhibiting higher levels of inequality, but that for each level of education, men exhibit a higher level of inequality within the group. Of particular interest though is women who hold only a high school diploma seeing a trend of declining in-group inequality over the years. After plotting out median incomes as well, it could be that an out sized number of women with only high school are making minimum wage which would account for both the much lower level of inequality of wages within this group, as well as the less volatile line for median wage. 
+
+# Limitations of Analysis
+
+As this paper uses the publicly available LFS data, certain information is excluded -- there are no observations for the Territories, no more location specific data than the province, nor is there any access to ethnicity/race variables. The standard scope of the LFS also applies: full-time members of the armed forces, people living on reserves, institutionalized persons, and those under the age of 15 are excluded. Some paper specific limitations are that I did not properly take into account the bias weights for each observation. The model created was perhaps simplistic, and a better approach could have involved using a different data set for certain macroeconomic variables to unpack the year to year variation further. As well, there was a lack of rigour in how the Gini coefficients were interpreted with regard to significance -- I will be frank, I just didn't manage to figure out how to approach that in good enough time. After reading some other works that are in a similar vein, see Gottschalk & Smeeding as well as Hadavand's papers linked in the references, I regret not including more comprehensive analysis of unemployment and labour force participation rates. I also wish that I included some more creative visual representations of the data and models. 
+
+# References
+
+Gottschalk, P., & Smeeding, T. M. (1997). Cross-National Comparisons of Earnings and Income Inequality. Journal of Economic Literature, 35(2), 633–687. <https://u.demog.berkeley.edu/~jrw/Biblio/Eprints/%20G-I/gottschalk.smeeding.1997.1p.pdf>
+
+Hadavand, A. (2017). Anatomy of Income Inequality in the United States: 1979-2013. Luxembourg Income Study, 686. <https://www.lisdatacenter.org/wps/liswps/686.pdf>
+
+Statistics Canada. (n.d.). Labour Force Survey: Public Use Microdata File. <https://www150.statcan.gc.ca/n1/en/catalogue/71M0001X>
+
+# AI Disclosures
+
+Through the course of this project, I utilized Gemini and a bit of Claude. Gemini does not provide an easy way to share the whole chat, so I've included some sample queries and responses and wrote a quick blurb explaining how the tools were used.
+
+Set-up help: <https://g.co/gemini/share/085ca32bc3d4>, <https://g.co/gemini/share/429555247dcd>
+
+Code assistance: <https://g.co/gemini/share/cc0925dc8fb8>, <https://g.co/gemini/share/6866b019b792> <https://g.co/gemini/share/898697efa94a>
+
+My main workflow for code corrections was to boot up a chat with Gemini and ask for help with specific R syntax issues rather than entire workflow planning. This approach allowed me to maintain control over the overall structure while getting assistance with technical implementation details. Or for general questions, for example this question and response <https://g.co/gemini/share/4acf62d26b19> where I ask how I can make it so that when I call gc() it doesn't put the stats in the knitted doc, and it told me I could just replace every gc() call with invisible(gc())
+
+One other tool I used was cursor, an AI-enabled IDE (uses Claude, and does so in a VSCode-like environment where it can access your whole codebase, operates with better context than a tool like Gemini or ChatGPT), and what I used that for, perhaps going into more of a "vibe-coding" territory, was for formatting the markdown document and helping with table formats. The key downside of allowing the AI to do your coding is that it can create code-structure you no longer understand, or that it can incorrectly execute your idea leading to errors -- thus I felt comfortable turning over the markdown formatting, both things I can do, but which I would be slow and bad at, like changing the font, background colours, etc. As well, it allowed me to add some functionality that I didn't know how to do, such as having a button to show/hide code blocks in the HTML output, or to add that full regression table to the report in a way that you could show/hide it. In case of breakage, I used Github for version control, starting a new branch where I apply the formatting changes I didn't really understand and then merging back into the main branch once I checked the knitting worked, ensuring that the only changes made to the markdown file were adding formatting. Here's an example of a prompt and response from Claude -- this use case is doing something that I could do, but which would be time-consuming(ish).
+
+Prompt: can you remove all the smoothed trendlines from the graphs generated (with block of code attached)
+Answer: I'd be happy to help you remove the smoothed trendlines from these graphs. To do this, you need to remove the geom_smooth() function calls from each plot in the code. Let me modify the code for you.
+(below is the output Claude generated)
+<https://claude.ai/public/artifacts/9487c84a-7d0a-4dce-8264-08ff5dc76ec3> 
+
+Another function which I generally used AI for is optimization of code, as mentioned above with garbage collection. I started doing this project on my desktop PC, and everything was running rather smoothly: I then swapped to my MacBook which had less than 1/4 of the RAM, and found I was hitting the Vector memory limit, and that it was taking 10+ minutes to compile/knit everything. I used Gemini to assess where I could get away with dropping objects, and also assessing where I could sub in more efficient functions for working with a large data set. For all this optimization, the most impactful change I made was switching away from my intial foolish idea to use every single month of LFS data since 2006, instead including data every six months.
