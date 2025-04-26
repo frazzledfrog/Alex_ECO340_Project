@@ -48,13 +48,6 @@ knitr::opts_chunk$set(
   gc.verbose = FALSE  # Suppress garbage collection output
 )
 
-# Make sure the required packages for code folding are loaded
-if (!requireNamespace("rmarkdown", quietly = TRUE)) {
-  install.packages("rmarkdown")
-}
-if (!requireNamespace("knitr", quietly = TRUE)) {
-  install.packages("knitr")
-}
 ```
 
 ```{r packages-and-data, include=FALSE}
@@ -86,10 +79,6 @@ packages_loaded <- sapply(required_packages, function(pkg) {
     return(TRUE)
   }
 })
-
-if (!packages_loaded["data.table"]) {
-  stop("Critical package 'data.table' could not be loaded. Aborting.")
-}
 
 csv_folder_path <- "C:/Users/Alex/Desktop/Alex_ECO340_Project" #modify this path!!!
 tryCatch({
@@ -134,6 +123,9 @@ if (length(csv_files) == 0) {
   rm(all_csv_files, all_basenames, matching_indices, csv_files, file_path)
   invisible(gc())
 }
+
+#Used gemini to help with set up here, make the loading of csv files and packages nice and neat
+
 ```
 
 # Introduction
